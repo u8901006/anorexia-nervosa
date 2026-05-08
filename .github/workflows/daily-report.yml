@@ -1,0 +1,116 @@
+name: Anorexia Nervosa Daily Report
+
+on:
+  schedule:
+    - cron: "40 14 * * *" # UTC 14:40 = 台北時間 22:40
+  workflow_dispatch:
+    inputs:
+      date:
+        description: "Target date (YYYY-MM-DD), leave empty for today"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('scripts/requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: pip install -r scripts/requirements.txt
+
+      - name: Determine date
+        id: date
+        run: |
+          if [ -n "${{ github.event.inputs.date }}" ]; then
+            echo "target=${{ github.event.inputs.date }}" >> "$GITHUB_OUTPUT"
+          else
+            TARGET=$(TZ=Asia/Taipei date +%Y-%m-%d)
+            echo "target=$TARGET" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Date: $(cat "$GITHUB_OUTPUT" | grep target | cut -d= -f2)"
+
+      - name: Find existing reports for dedup
+        id: dedup
+        run: |
+          EXISTING=""
+          for i in $(seq 0 6); do
+            D=$(TZ=Asia/Taipei date -d "$i days ago" +%Y-%m-%d)
+            F="docs/anorexia-${D}.html"
+            if [ -f "$F" ]; then
+              EXISTING="$F"
+              echo "Found existing report: $F"
+              break
+            fi
+          done
+          echo "existing=$EXISTING" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch papers from PubMed
+        run: |
+          ARGS="--days 7 --max-papers 50 --json --output papers.json"
+          if [ -n "${{ steps.dedup.outputs.existing }}" ]; then
+            ARGS="$ARGS --skip-existing ${{ steps.dedup.outputs.existing }}"
+          fi
+          python scripts/fetch_papers.py $ARGS
+        continue-on-error: true
+
+      - name: Check papers data
+        id: papers
+        run: |
+          if [ -f papers.json ] && grep -q '"count"' papers.json; then
+            COUNT=$(python -c "import json; print(json.load(open('papers.json')).get('count',0))")
+            echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+            echo "Papers found: $COUNT"
+          else
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo '{"date":"${{ steps.date.outputs.target }}","count":0,"papers":[]}' > papers.json
+            echo "No papers found, will generate empty report"
+          fi
+
+      - name: Generate report with Zhipu AI
+        env:
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+        run: |
+          python scripts/generate_report.py \
+            --input papers.json \
+            --output "docs/anorexia-${{ steps.date.outputs.target }}.html" \
+            --api-key "$ZHIPU_API_KEY"
+
+      - name: Generate index page
+        run: python scripts/generate_index.py
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/
+          git diff --cached --quiet && echo "No changes to commit" && exit 0
+          git commit -m "📄 anorexia nervosa daily report: ${{ steps.date.outputs.target }}"
+          git pull --rebase origin main
+          git push
+
+      - name: Summary
+        run: |
+          echo "### 📄 Anorexia Nervosa Daily Report" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Date:** ${{ steps.date.outputs.target }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Papers analyzed:** ${{ steps.papers.outputs.count }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Report:** [anorexia-${{ steps.date.outputs.target }}.html](https://u8901006.github.io/anorexia-nervosa/anorexia-${{ steps.date.outputs.target }}.html)" >> "$GITHUB_STEP_SUMMARY"
